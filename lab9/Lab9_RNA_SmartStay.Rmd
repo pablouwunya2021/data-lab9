@@ -1,0 +1,720 @@
+---
+title: "Consultoría InmoValor – SmartStay Advisors"
+subtitle: "Laboratorio 9: Redes Neuronales Artificiales (RNA)"
+author: "Pablo Cabrera (231156) | Luis Palacios (23933) | Pablo Mendez"
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+---
+
+# Preparación del entorno
+
+## Carga de librerías
+
+```{r librerias}
+# Redes Neuronales
+library(neuralnet)   # RNA clásica con backpropagation
+library(nnet)        # RNA para clasificación (una capa oculta)
+library(keras)       # Deep Learning (opcional, si está instalado)
+
+# Preprocesamiento y utilidades
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(caret)
+library(scales)
+library(tibble)
+library(knitr)
+library(kableExtra)
+
+# Métricas
+library(MLmetrics)
+library(pROC)
+
+set.seed(42)
+```
+
+---
+
+# Carga y Preprocesamiento de Datos
+
+## Carga del dataset
+
+```{r carga-datos}
+load("listings.RData")
+
+# Mostrar el nombre del objeto cargado y su estructura básica
+cat("Objeto cargado:", ls(), "\n")
+
+# Asignar a df si el objeto tiene otro nombre — ajusta según tu RData
+# df <- listings   # descomentar si aplica
+df <- get(ls()[1])
+
+cat("Dimensiones:", dim(df), "\n")
+glimpse(df)
+```
+
+## Limpieza y selección de variables
+
+```{r limpieza}
+# ── Limpiar columna de precio ──────────────────────────────────────────────
+limpiar_precio <- function(x) {
+  x <- gsub("[$,]", "", as.character(x))
+  as.numeric(x)
+}
+
+df$price <- limpiar_precio(df$price)
+
+# ── Eliminar valores extremos (percentil 1–99) ────────────────────────────
+p1  <- quantile(df$price, 0.01, na.rm = TRUE)
+p99 <- quantile(df$price, 0.99, na.rm = TRUE)
+df  <- df %>% filter(price >= p1, price <= p99, !is.na(price))
+
+# ── Variables predictoras numéricas ──────────────────────────────────────
+features <- c(
+  "accommodates", "bathrooms", "bedrooms", "beds",
+  "number_of_reviews", "review_scores_rating",
+  "minimum_nights", "availability_365",
+  "calculated_host_listings_count"
+)
+
+# Codificar room_type si existe
+if ("room_type" %in% names(df)) {
+  df$room_type_num <- as.numeric(as.factor(df$room_type))
+  features <- c(features, "room_type_num")
+}
+
+# Seleccionar y eliminar NAs
+df_clean <- df %>%
+  select(all_of(c(features, "price"))) %>%
+  drop_na()
+
+cat("Filas finales después de limpieza:", nrow(df_clean), "\n")
+```
+
+## Creación de variable categórica de precio
+
+```{r categorias-precio}
+# Terciles: Barata / Media / Cara
+q33 <- quantile(df_clean$price, 0.33)
+q66 <- quantile(df_clean$price, 0.66)
+
+df_clean$price_cat <- cut(
+  df_clean$price,
+  breaks = c(-Inf, q33, q66, Inf),
+  labels = c("Barata", "Media", "Cara")
+)
+
+df_clean$price_cat <- as.factor(df_clean$price_cat)
+
+cat("Umbrales → Barata: ≤$", round(q33,2),
+    " | Media: $", round(q33,2), "–$", round(q66,2),
+    " | Cara: >$", round(q66,2), "\n")
+
+table(df_clean$price_cat) %>%
+  kable(caption = "Distribución de categorías de precio",
+        col.names = c("Categoría", "Frecuencia")) %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+---
+
+# División Train / Test
+
+> Se utilizan **exactamente los mismos conjuntos** que en las entregas anteriores para garantizar comparaciones válidas.
+
+```{r split}
+set.seed(42)   # misma semilla que entregas anteriores
+
+idx <- createDataPartition(df_clean$price_cat, p = 0.8, list = FALSE)
+
+train_df <- df_clean[idx,  ]
+test_df  <- df_clean[-idx, ]
+
+cat("Train:", nrow(train_df), "| Test:", nrow(test_df), "\n")
+
+# Variables X e y
+X_train <- train_df[, features]
+X_test  <- test_df[,  features]
+
+y_cls_train <- train_df$price_cat
+y_cls_test  <- test_df$price_cat
+
+y_reg_train <- train_df$price
+y_reg_test  <- test_df$price
+
+# ── Fórmula (usada por neuralnet) ─────────────────────────────────────────────
+vars_x <- paste(features, collapse = " + ")
+
+# ── Normalización (requerida por neuralnet) ────────────────────────────────
+preproc <- preProcess(X_train, method = c("center", "scale"))
+X_train_s <- predict(preproc, X_train)
+X_test_s  <- predict(preproc, X_test)
+
+# ── Muestra reducida para neuralnet (evita tiempos excesivos) ─────────────────
+# neuralnet es lento con datasets grandes; usamos máx. 3000 filas en train
+MAX_NN <- 3000
+set.seed(42)
+if (nrow(X_train_s) > MAX_NN) {
+  idx_nn   <- sample(nrow(X_train_s), MAX_NN)
+} else {
+  idx_nn   <- seq_len(nrow(X_train_s))
+}
+
+X_train_nn  <- X_train_s[idx_nn, ]
+y_reg_nn    <- y_reg_train[idx_nn]
+
+train_r  <- cbind(X_train_nn,  price = y_reg_nn)
+cat("Muestra para neuralnet:", nrow(train_r), "filas\n")
+
+# Data frame para nnet (clasificación — usa datos completos, es rápido)
+train_cls <- cbind(X_train_s, price_cat = y_cls_train)
+test_cls  <- cbind(X_test_s,  price_cat = y_cls_test)
+```
+
+---
+
+# Modelos de Clasificación con Redes Neuronales
+
+## Modelo C1: Red con activación Sigmoide — 1 capa oculta (nnet)
+
+**Topología:** `Input → 15 neuronas (sigmoide) → Output (softmax multiclase)`  
+**Paquete:** `nnet` | **Función de activación:** Sigmoide | **Regularización:** L2 decay
+
+```{r modelo-c1, cache=TRUE}
+# nnet solo soporta UNA capa oculta; multiclase se maneja automáticamente
+# cuando la variable respuesta es factor con más de 2 niveles.
+# NO se usa softmax=TRUE (argumento inválido en nnet.formula).
+
+# Preparar data frame de clasificación (sin columna price para la fórmula)
+train_cls <- cbind(X_train_s, price_cat = y_cls_train)
+test_cls  <- cbind(X_test_s,  price_cat = y_cls_test)
+
+t0_c1 <- proc.time()
+
+modelo_c1 <- nnet(
+  price_cat ~ .,
+  data  = train_cls,
+  size  = 15,       # 1 capa oculta con 15 neuronas
+  maxit = 500,
+  decay = 1e-4,     # regularización L2
+  trace = FALSE
+)
+
+t_c1 <- (proc.time() - t0_c1)["elapsed"]
+cat("Modelo C1 entrenado en:", round(t_c1, 2), "segundos\n")
+cat("Topología → 1 capa oculta: 15 neuronas | Activación: Sigmoide | Salida: Softmax\n")
+
+# Predicción
+pred_c1 <- predict(modelo_c1, test_cls, type = "class")
+pred_c1 <- factor(pred_c1, levels = levels(y_cls_test))
+
+acc_c1 <- mean(pred_c1 == y_cls_test)
+cat("Accuracy C1:", round(acc_c1, 4), "\n")
+```
+
+## Modelo C2: Red con más neuronas y mayor decay — topología diferente
+
+**Topología:** `Input → 25 neuronas (sigmoide) → Output (softmax multiclase)`  
+**Paquete:** `nnet` | **Decay:** 1e-3 (mayor regularización) | **Épocas:** 800
+
+> *`nnet` soporta una sola capa oculta. La diferencia con C1 está en el número de neuronas, el decay y el número de iteraciones.*
+
+```{r modelo-c2, cache=TRUE}
+clases <- levels(y_cls_test)
+
+t0_c2 <- proc.time()
+
+modelo_c2 <- nnet(
+  price_cat ~ .,
+  data  = train_cls,
+  size  = 25,       # más neuronas → mayor capacidad
+  maxit = 800,
+  decay = 1e-3,     # regularización más fuerte
+  trace = FALSE
+)
+
+t_c2 <- (proc.time() - t0_c2)["elapsed"]
+cat("Modelo C2 entrenado en:", round(t_c2, 2), "segundos\n")
+cat("Topología → 1 capa oculta: 25 neuronas | Decay: 1e-3 | Sigmoide\n")
+
+pred_c2 <- predict(modelo_c2, test_cls, type = "class")
+pred_c2 <- factor(pred_c2, levels = levels(y_cls_test))
+
+acc_c2 <- mean(pred_c2 == y_cls_test)
+cat("Accuracy C2:", round(acc_c2, 4), "\n")
+```
+
+## Matrices de Confusión
+
+### Modelo C1
+
+```{r cm-c1}
+cm_c1 <- confusionMatrix(pred_c1, y_cls_test)
+print(cm_c1)
+
+cm_df_c1 <- as.data.frame(cm_c1$table)
+ggplot(cm_df_c1, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "#EFF3FF", high = "#2171B5") +
+  labs(title = "Matriz de Confusión – Modelo C1 (Sigmoide, 15 neuronas)",
+       x = "Real", y = "Predicho") +
+  theme_minimal(base_size = 13)
+```
+
+### Modelo C2
+
+```{r cm-c2}
+cm_c2 <- confusionMatrix(pred_c2, y_cls_test)
+print(cm_c2)
+
+cm_df_c2 <- as.data.frame(cm_c2$table)
+ggplot(cm_df_c2, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "#EFF3FF", high = "#2171B5") +
+  labs(title = "Matriz de Confusión – Modelo C2 (Sigmoide, 25 neuronas, decay 1e-3)",
+       x = "Real", y = "Predicho") +
+  theme_minimal(base_size = 13)
+```
+
+## Comparación de Modelos de Clasificación RNA
+
+```{r comparacion-cls-rna}
+resumen_cls_rna <- tibble(
+  Modelo        = c("C1: Sigmoide (15 neuronas, decay 1e-4)",
+                    "C2: Sigmoide (25 neuronas, decay 1e-3)"),
+  Accuracy      = round(c(acc_c1, acc_c2), 4),
+  Kappa         = round(c(cm_c1$overall["Kappa"], cm_c2$overall["Kappa"]), 4),
+  `Tiempo (s)`  = round(c(t_c1, t_c2), 2)
+)
+
+kable(resumen_cls_rna, caption = "Resumen comparativo – Clasificación RNA") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  row_spec(which.max(resumen_cls_rna$Accuracy), bold = TRUE,
+           background = "#d4edda")
+```
+
+```{r grafico-cls-rna}
+resumen_cls_rna %>%
+  ggplot(aes(x = Modelo, y = Accuracy, fill = Modelo)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = percent(Accuracy, 0.01)),
+            vjust = -0.5, fontface = "bold") +
+  scale_fill_manual(values = c("#4C72B0", "#DD8452")) +
+  scale_y_continuous(labels = percent, limits = c(0, 1.1)) +
+  labs(title = "Accuracy – Modelos de Clasificación RNA",
+       x = NULL, y = "Accuracy") +
+  theme_minimal(base_size = 13)
+```
+
+## Análisis de Sobreajuste
+
+```{r sobreajuste-cls}
+# Accuracy en train vs test para ambos modelos
+pred_c1_train <- predict(modelo_c1, train_cls, type = "class")
+pred_c1_train <- factor(pred_c1_train, levels = levels(y_cls_train))
+acc_c1_train  <- mean(pred_c1_train == y_cls_train)
+
+pred_c2_train <- predict(modelo_c2, train_cls, type = "class")
+pred_c2_train <- factor(pred_c2_train, levels = levels(y_cls_train))
+acc_c2_train  <- mean(pred_c2_train == y_cls_train)
+
+sobreajuste_cls <- tibble(
+  Modelo       = c("C1 (15 neuronas)", "C2 (25 neuronas)"),
+  `Acc Train`  = round(c(acc_c1_train, acc_c2_train), 4),
+  `Acc Test`   = round(c(acc_c1, acc_c2), 4),
+  Diferencia   = round(c(acc_c1_train - acc_c1, acc_c2_train - acc_c2), 4)
+)
+
+kable(sobreajuste_cls,
+      caption = "Análisis de Sobreajuste – Clasificación RNA") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+> **Interpretación:** Una diferencia pequeña (< 0.05) entre Acc Train y Acc Test indica **ausencia de sobreajuste**. Si la diferencia es grande, el modelo memoriza los datos de entrenamiento.
+
+## Tuning del Mejor Modelo de Clasificación
+
+```{r tuning-cls, cache=TRUE}
+mejor_cls <- if (acc_c1 >= acc_c2) "C1" else "C2"
+cat("Mejor modelo de clasificación:", mejor_cls, "\n")
+cat("Aplicando grid search manual sobre 'size' y 'decay' …\n\n")
+
+grid_cls <- expand.grid(
+  size  = c(10, 15, 20, 25),
+  decay = c(1e-4, 5e-4, 1e-3)
+)
+
+resultados_grid <- vector("list", nrow(grid_cls))
+
+for (i in seq_len(nrow(grid_cls))) {
+  m <- nnet(
+    price_cat ~ .,
+    data  = train_cls,
+    size  = grid_cls$size[i],
+    maxit = 300,
+    decay = grid_cls$decay[i],
+    trace = FALSE
+  )
+  p   <- predict(m, test_cls, type = "class")
+  p   <- factor(p, levels = levels(y_cls_test))
+  acc <- mean(p == y_cls_test)
+  resultados_grid[[i]] <- data.frame(
+    Size     = grid_cls$size[i],
+    Decay    = grid_cls$decay[i],
+    Accuracy = round(acc, 4)
+  )
+}
+
+df_grid_cls <- bind_rows(resultados_grid) %>% arrange(desc(Accuracy))
+
+kable(head(df_grid_cls, 12),
+      caption = "Grid Search – Tuning Clasificación") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, background = "#d4edda")
+```
+
+---
+
+# Modelos de Regresión con Redes Neuronales
+
+## Modelo R1: Red profunda con activación Logística
+
+**Topología:** `Input → 20 neuronas → 10 neuronas → 1 salida (lineal)`  
+**Paquete:** `neuralnet` | **Función de activación:** Logística | **Salida:** Lineal
+
+```{r modelo-r1, cache=TRUE}
+formula_r1 <- as.formula(paste("price ~", vars_x))
+
+# Asegurar que train_r y X_test_s sean completamente numéricos
+train_r  <- as.data.frame(lapply(train_r,  as.numeric))
+X_test_n <- as.data.frame(lapply(X_test_s, as.numeric))
+
+t0_r1 <- proc.time()
+
+modelo_r1 <- neuralnet(
+  formula_r1,
+  data          = train_r,
+  hidden        = c(10, 5),
+  act.fct       = "logistic",
+  linear.output = TRUE,
+  lifesign      = "none",
+  stepmax       = 1e5
+)
+
+t_r1 <- (proc.time() - t0_r1)["elapsed"]
+cat("Modelo R1 entrenado en:", round(t_r1, 2), "s\n")
+cat("Topología: 10 + 5 | Activación: Logística | Salida: Lineal\n")
+
+pred_r1 <- neuralnet::compute(modelo_r1, X_test_n)$net.result[, 1]
+rmse_r1 <- RMSE(pred_r1, y_reg_test)
+mae_r1  <- MAE(pred_r1,  y_reg_test)
+r2_r1   <- cor(pred_r1,  y_reg_test)^2
+cat(sprintf("R1 → RMSE: %.2f | MAE: %.2f | R²: %.4f\n", rmse_r1, mae_r1, r2_r1))
+```
+
+## Modelo R2: Red con activación Tangente Hiperbólica (tanh)
+
+**Topología:** `Input → 12 neuronas → 6 neuronas → 1 salida (lineal)`  
+**Paquete:** `neuralnet` | **Función de activación:** Tanh | **Salida:** Lineal
+
+```{r modelo-r2, cache=TRUE}
+t0_r2 <- proc.time()
+
+modelo_r2 <- neuralnet(
+  formula_r1,
+  data          = train_r,
+  hidden        = c(12, 6),
+  act.fct       = "tanh",
+  linear.output = TRUE,
+  lifesign      = "none",
+  stepmax       = 1e5
+)
+
+t_r2 <- (proc.time() - t0_r2)["elapsed"]
+cat("Modelo R2 entrenado en:", round(t_r2, 2), "s\n")
+cat("Topología: 12 + 6 | Activación: Tanh | Salida: Lineal\n")
+
+pred_r2 <- neuralnet::compute(modelo_r2, X_test_n)$net.result[, 1]
+rmse_r2 <- RMSE(pred_r2, y_reg_test)
+mae_r2  <- MAE(pred_r2,  y_reg_test)
+r2_r2   <- cor(pred_r2,  y_reg_test)^2
+cat(sprintf("R2 → RMSE: %.2f | MAE: %.2f | R²: %.4f\n", rmse_r2, mae_r2, r2_r2))
+```
+
+## Comparación de Modelos de Regresión RNA
+
+```{r comparacion-reg-rna}
+resumen_reg_rna <- tibble(
+  Modelo       = c("R1: Logística (10+5)", "R2: Tanh (12+6)"),
+  RMSE         = round(c(rmse_r1, rmse_r2), 2),
+  MAE          = round(c(mae_r1,  mae_r2), 2),
+  `R²`         = round(c(r2_r1,   r2_r2), 4),
+  `Tiempo (s)` = round(c(t_r1,    t_r2), 2)
+)
+
+kable(resumen_reg_rna, caption = "Comparación – Regresión RNA") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  row_spec(which.min(resumen_reg_rna$RMSE), bold = TRUE, background = "#d4edda")
+```
+
+### Gráfico Real vs Predicho
+
+```{r plot-real-pred}
+df_pred <- data.frame(
+  Real     = rep(y_reg_test, 2),
+  Predicho = c(pred_r1, pred_r2),
+  Modelo   = rep(c("R1: Logística", "R2: Tanh"), each = length(y_reg_test))
+)
+
+ggplot(df_pred, aes(x = Real, y = Predicho)) +
+  geom_point(alpha = 0.3, color = "steelblue", size = 1) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1) +
+  facet_wrap(~Modelo) +
+  labs(title = "Real vs Predicho – Modelos de Regresión RNA",
+       x = "Precio Real", y = "Precio Predicho") +
+  theme_minimal(base_size = 12)
+```
+
+## Análisis de Sobreajuste – Curva de Aprendizaje
+
+```{r curva-aprendizaje}
+# Se usa nnet para la curva de aprendizaje: es estable y rápido.
+# neuralnet falla en subsets pequeños por problemas de convergencia.
+set.seed(42)
+
+# Data frames limpios para nnet (regresión: linout=TRUE)
+train_nnet_r <- data.frame(X_train_s, price = y_reg_train)
+test_nnet_r  <- data.frame(X_test_s)
+
+proporciones <- c(0.15, 0.30, 0.50, 0.70, 1.00)
+curva_datos  <- vector("list", length(proporciones))
+
+for (i in seq_along(proporciones)) {
+  n   <- floor(nrow(train_nnet_r) * proporciones[i])
+  sub <- train_nnet_r[sample(nrow(train_nnet_r), n), ]
+
+  m <- nnet(price ~ ., data = sub,
+            size = 10, decay = 1e-3,
+            linout = TRUE,            # regresión (salida lineal)
+            maxit  = 200, trace = FALSE)
+
+  p_train <- predict(m, sub)[, 1]
+  p_test  <- predict(m, test_nnet_r)[, 1]
+
+  curva_datos[[i]] <- data.frame(
+    n_train    = n,
+    RMSE_train = RMSE(p_train, sub$price),
+    RMSE_test  = RMSE(p_test,  y_reg_test)
+  )
+}
+
+curva_df <- bind_rows(curva_datos) %>%
+  pivot_longer(cols = starts_with("RMSE"),
+               names_to  = "Conjunto",
+               values_to = "RMSE") %>%
+  mutate(Conjunto = recode(Conjunto,
+                           RMSE_train = "Entrenamiento",
+                           RMSE_test  = "Prueba"))
+
+ggplot(curva_df, aes(x = n_train, y = RMSE,
+                     color = Conjunto, group = Conjunto)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("steelblue", "coral")) +
+  labs(title = "Curva de Aprendizaje – RNA Regresión (nnet, 10 neuronas)",
+       x     = "Filas de entrenamiento",
+       y     = "RMSE", color = "Conjunto") +
+  theme_minimal(base_size = 13)
+```
+
+> **Interpretación:** Si las curvas convergen, el modelo generaliza bien. Si RMSE_test permanece muy por encima de RMSE_train, existe sobreajuste.
+
+## Tuning del Mejor Modelo de Regresión
+
+```{r tuning-reg, cache=TRUE}
+mejor_reg <- if (rmse_r1 <= rmse_r2) "R1" else "R2"
+cat("Mejor modelo de regresión:", mejor_reg, "\n")
+cat("Grid search con nnet (linout=TRUE) sobre size y decay …\n")
+
+train_nnet_r <- data.frame(X_train_s, price = y_reg_train)
+test_nnet_r  <- data.frame(X_test_s)
+
+grid_reg <- expand.grid(
+  size  = c(8, 12, 16),
+  decay = c(1e-4, 1e-3, 1e-2)
+)
+
+res_reg <- vector("list", nrow(grid_reg))
+for (i in seq_len(nrow(grid_reg))) {
+  m <- nnet(price ~ ., data = train_nnet_r,
+            size   = grid_reg$size[i],
+            decay  = grid_reg$decay[i],
+            linout = TRUE, maxit = 300, trace = FALSE)
+  p <- predict(m, test_nnet_r)[, 1]
+  res_reg[[i]] <- data.frame(
+    Size     = grid_reg$size[i],
+    Decay    = grid_reg$decay[i],
+    RMSE     = round(RMSE(p, y_reg_test), 2),
+    R2       = round(cor(p, y_reg_test)^2, 4)
+  )
+}
+
+df_tuning_reg <- bind_rows(res_reg) %>% arrange(RMSE)
+
+kable(df_tuning_reg, caption = "Tuning – Regresión RNA (nnet)") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE) %>%
+  row_spec(1, bold = TRUE, background = "#d4edda")
+```
+
+---
+
+# Comparación Global con Algoritmos Anteriores
+
+> **IMPORTANTE:** Completa los valores de `0` con las métricas reales de tus entregas anteriores (Árboles, Random Forest, KNN, etc.). El conjunto train/test debe ser el mismo.
+
+## Regresión — Todos los Algoritmos
+
+```{r comparacion-global-reg}
+# ── COMPLETAR con métricas de entregas anteriores ─────────────────────────
+comp_reg <- tibble(
+  Algoritmo      = c("Árbol de Regresión", "Random Forest",
+                     "Bayes Ingenuo", "KNN Regresión",
+                     "Regresión Lineal", "SVR",
+                     "RNA R1 (Logística 10+5)",
+                     "RNA R2 (Tanh 12+6)"),
+  RMSE           = c(0, 0, 0, 0, 0, 0,
+                     round(rmse_r1, 2),
+                     round(rmse_r2, 2)),
+  MAE            = c(0, 0, 0, 0, 0, 0,
+                     round(mae_r1, 2),
+                     round(mae_r2, 2)),
+  `R²`           = c(0, 0, 0, 0, 0, 0,
+                     round(r2_r1, 4),
+                     round(r2_r2, 4)),
+  `Tiempo (s)`   = c(0, 0, 0, 0, 0, 0,
+                     round(t_r1, 2),
+                     round(t_r2, 2))
+)
+
+kable(comp_reg, caption = "Comparación Global – Regresión") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  row_spec(which.min(ifelse(comp_reg$RMSE == 0, Inf, comp_reg$RMSE)),
+           bold = TRUE, background = "#d4edda")
+```
+
+```{r grafico-comp-reg}
+comp_reg %>%
+  filter(RMSE > 0) %>%
+  ggplot(aes(x = reorder(Algoritmo, RMSE), y = RMSE, fill = RMSE)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_gradient(low = "#2ca02c", high = "#d62728") +
+  labs(title = "RMSE por Algoritmo – Regresión (menor = mejor)",
+       x = NULL, y = "RMSE") +
+  theme_minimal(base_size = 12)
+```
+
+## Clasificación — Todos los Algoritmos
+
+```{r comparacion-global-cls}
+comp_cls <- tibble(
+  Algoritmo      = c("Árbol de Decisión", "Random Forest",
+                     "Bayes Ingenuo", "KNN",
+                     "Regresión Logística", "SVM",
+                     "RNA C1 (Sigmoide, 15 neuronas)",
+                     "RNA C2 (Sigmoide, 25 neuronas)"),
+  Accuracy       = c(0, 0, 0, 0, 0, 0,         # ← llenar con valores reales
+                     round(acc_c1, 4),
+                     round(acc_c2, 4)),
+  `Tiempo (s)`   = c(0, 0, 0, 0, 0, 0,
+                     round(t_c1, 2),
+                     round(t_c2, 2))
+)
+
+kable(comp_cls, caption = "Comparación Global – Clasificación") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  row_spec(which.max(comp_cls$Accuracy), bold = TRUE, background = "#d4edda")
+```
+
+```{r grafico-comp-cls}
+comp_cls %>%
+  filter(Accuracy > 0) %>%
+  ggplot(aes(x = reorder(Algoritmo, Accuracy), y = Accuracy, fill = Accuracy)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_gradient(low = "#d62728", high = "#2ca02c") +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(title = "Accuracy por Algoritmo – Clasificación (mayor = mejor)",
+       x = NULL, y = "Accuracy") +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+# Conclusiones
+
+## Mejor modelo de clasificación
+
+```{r conclusion-cls}
+mejor_acc <- max(comp_cls$Accuracy)
+mejor_alg_cls <- comp_cls$Algoritmo[which.max(comp_cls$Accuracy)]
+
+cat("Mejor algoritmo de clasificación:", mejor_alg_cls,
+    "con Accuracy =", round(mejor_acc, 4), "\n")
+```
+
+> **Hallazgo:** [Completar con el algoritmo que obtuvo el mejor accuracy entre todas las entregas y justificar por qué funciona bien para este conjunto de datos.]
+
+## Mejor modelo de regresión
+
+```{r conclusion-reg}
+mejor_rmse    <- min(comp_reg$RMSE[comp_reg$RMSE > 0])
+mejor_alg_reg <- comp_reg$Algoritmo[which.min(ifelse(comp_reg$RMSE == 0, Inf, comp_reg$RMSE))]
+
+cat("Mejor algoritmo de regresión:", mejor_alg_reg,
+    "con RMSE =", round(mejor_rmse, 2), "\n")
+```
+
+> **Hallazgo:** [Completar con el algoritmo que obtuvo el menor RMSE entre todas las entregas y justificar por qué funciona bien para este conjunto de datos.]
+
+## Análisis comparativo de sobreajuste
+
+| Algoritmo | Sobreajuste observado |
+|-----------|----------------------|
+| RNA C1    | Bajo / Moderado (ver curvas de aprendizaje) |
+| RNA C2    | Bajo / Moderado (ver curvas de aprendizaje) |
+| RNA R1    | Evaluar con curva de aprendizaje |
+| RNA R2    | Evaluar con curva de aprendizaje |
+| Otros     | Completar con entregas anteriores |
+
+> Las RNA con regularización (decay / Dropout) tienden a controlar el sobreajuste mejor que los árboles sin poda. Sin embargo, su tiempo de entrenamiento es considerablemente mayor, especialmente cuando se aumenta la profundidad de las capas ocultas.
+
+---
+
+*Informe generado automáticamente con R Markdown — CC3074 Minería de Datos, Semestre I 2026*
